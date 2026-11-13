@@ -610,8 +610,14 @@ def attach_sponsored_content(text: str, reply_markup=None) -> Tuple[str, Optiona
 esc = html.escape
 
 
-def btn(text: str, data: Optional[str] = None, url: Optional[str] = None, style: Optional[str] = None) -> InlineKeyboardButton:
-    """Inline button supporting text, callback_data, URLs, and Bot API 9.4+ styles."""
+def btn(text: str, data: Optional[str] = None, style: Optional[str] = None, *, url: Optional[str] = None) -> InlineKeyboardButton:
+    """Inline button supporting text, callback_data, URLs, and Bot API 9.4+ styles.
+    Usage:
+        btn("Text", "callback_data")            – plain callback button
+        btn("Text", "callback_data", PRIMARY)   – styled callback button
+        btn("Text", url="https://...")          – URL button
+        btn("Text", url="https://...", style=SUCCESS)  – styled URL button
+    """
     kwargs = {}
     if url:
         kwargs["url"] = url

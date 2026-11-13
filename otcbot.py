@@ -2,8 +2,11 @@
 Telegram OTC Utility Bot — Production Grade Upgrade
 
 Features:
-- Admin-only reply-based timed /pin, /unpin, /cancelpin, /pinlist
+- Admin-only reply-based timed /pin, /unpin, /cancelpin, /pinlist (raw clickable commands)
 - Temporary Automatic Pinning mode (/apin) with preset & custom duration
+- Group addition detection: prompts to register as OTC with admin-only callback button
+- Automatic check if group is already registered ("This group is already registered as an OTC.")
+- "Add to Group" button in bot DM (/start, /help, /info, and dashboard)
 - SQLite persistence, schema migrations, and restart-safe background workers
 - Interactive Settings Panel (/settings) for service messages, pins, AI, and bot activity
 - Multi-owner system with centralized authorization
@@ -338,8 +341,31 @@ async def require_group_admin(update: Update, context: ContextTypes.DEFAULT_TYPE
     chat = update.effective_chat
     if not message or not chat:
         return False
+
     if chat.type not in GROUP_TYPES:
-        await message.reply_text(f"{e_html('warning')} This command works in OTCs only.", parse_mode=ParseMode.HTML)
+        bot_user = context.bot.username or (await context.bot.get_me()).username
+        add_url = f"https://t.me/{bot_user}?startgroup=true"
+        await message.reply_text(
+            f"{e_html('warning')} This command works in OTC groups only.\n"
+            f"Add me to your group with the button below:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[btn("➕ Add to Group", url=add_url)]]),
+        )
+        return False
+
+    # Check if group is registered as an OTC
+    row = group_row(chat.id)
+    if not row:
+        text = (
+            f"<b>{e_html('warning')} This group is not registered as an OTC yet.</b>\n\n"
+            f"Do you want to register this group as an OTC?\n"
+            f"<i>Only group administrators can complete this registration.</i>"
+        )
+        markup = InlineKeyboardMarkup([
+            [btn(f"{e('otc')} Register as OTC", f"reg:confirm:{chat.id}", SUCCESS)],
+            [btn(f"{e('dismiss')} Dismiss", "dismiss", DANGER)],
+        ])
+        await message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
         return False
 
     # Check OTC general active setting
@@ -351,13 +377,14 @@ async def require_group_admin(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not anonymous_admin and not (user and await is_group_admin(context.bot, chat.id, user.id)):
         await message.reply_text(f"{e_html('error')} Available to OTC admins only.", parse_mode=ParseMode.HTML)
         return False
+
     if not await bot_can_pin(context.bot, chat.id):
         await message.reply_text(
             f"{e_html('warning')} I require administrator permissions with <b>'Pin messages'</b> enabled.",
             parse_mode=ParseMode.HTML,
         )
         return False
-    await register_group(chat)
+
     return True
 
 
@@ -503,17 +530,93 @@ async def delete_message_safe(message):
 # Registration & User Tracking
 # ==========================================
 
-async def register_group(chat) -> None:
-    if chat.type not in GROUP_TYPES:
+async def prompt_or_confirm_registration(chat, context: ContextTypes.DEFAULT_TYPE):
+    """Prompt group to register as an OTC with an admin-only button, or inform if already registered."""
+    row = q_one("SELECT * FROM groups WHERE chat_id=? AND active=1", (chat.id,))
+    if row:
+        text = f"{e_html('otc')} <b>This group is already registered as an OTC.</b>"
+        markup = InlineKeyboardMarkup([
+            [btn(f"{e('settings')} OTC Settings", f"st:cat:{chat.id}:main")],
+            [btn(f"{e('dismiss')} Dismiss", "dismiss", DANGER)],
+        ])
+        await context.bot.send_message(chat.id, text, parse_mode=ParseMode.HTML, reply_markup=markup)
+    else:
+        text = (
+            f"<b>{e_html('otc')} OTC Registration</b>\n\n"
+            f"Do you want to register this group as an OTC?\n\n"
+            f"<i>Only group administrators can complete this registration.</i>"
+        )
+        markup = InlineKeyboardMarkup([
+            [btn(f"{e('otc')} Register as OTC", f"reg:confirm:{chat.id}", SUCCESS)],
+            [btn(f"{e('dismiss')} Dismiss", "dismiss", DANGER)],
+        ])
+        await context.bot.send_message(chat.id, text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+
+async def callback_register(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin-only callback to confirm OTC registration."""
+    query = update.callback_query
+    await query.answer()
+    parts = query.data.split(":")
+    chat_id = int(parts[2])
+
+    # 1. Admin check: can only be tapped by admins
+    if not await is_group_admin(context.bot, chat_id, query.from_user.id):
+        await query.answer("Only group administrators can register this OTC.", show_alert=True)
         return
+
+    # 2. Check if already registered
+    row = q_one("SELECT * FROM groups WHERE chat_id=? AND active=1", (chat_id,))
+    if row:
+        await edit(query, f"{e_html('otc')} <b>This group is already registered as an OTC.</b>")
+        return
+
+    # 3. Perform registration
+    chat = await context.bot.get_chat(chat_id)
     execute(
-        """INSERT INTO groups(chat_id,title,username,active,created_at)
-           VALUES(?,?,?,?,?)
+        """INSERT INTO groups(chat_id, title, username, active, created_at)
+           VALUES(?, ?, ?, 1, ?)
            ON CONFLICT(chat_id) DO UPDATE SET
            title=excluded.title, username=excluded.username, active=1""",
-        (chat.id, chat.title or "OTC", chat.username, 1, time.time()),
+        (chat_id, chat.title or "OTC", chat.username, time.time()),
     )
-    get_otc_settings(chat.id)
+    get_otc_settings(chat_id)
+
+    text = (
+        f"{e_html('success')} <b>Success! This group is now registered as an OTC.</b>\n\n"
+        f"Admins can now use /pin, /apin, /settings, /ai, and /help."
+    )
+    markup = InlineKeyboardMarkup([
+        [btn(f"{e('settings')} OTC Settings", f"st:cat:{chat_id}:main")],
+        [btn(f"{e('dismiss')} Dismiss", "dismiss", DANGER)],
+    ])
+    await edit(query, text, markup)
+
+
+async def cmd_register(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manual /register command inside a group or DM."""
+    message = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+    if not message or not chat:
+        return
+
+    if chat.type not in GROUP_TYPES:
+        bot_user = context.bot.username or (await context.bot.get_me()).username
+        add_url = f"https://t.me/{bot_user}?startgroup=true"
+        await message.reply_text(
+            f"{e_html('warning')} The /register command works in OTC groups only.\n"
+            f"Add me to your group with the button below:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[btn("➕ Add to Group", url=add_url)]]),
+        )
+        return
+
+    if not await is_group_admin(context.bot, chat.id, user.id):
+        await message.reply_text(f"{e_html('error')} Available to OTC admins only.", parse_mode=ParseMode.HTML)
+        return
+
+    await prompt_or_confirm_registration(chat, context)
 
 
 def group_row(chat_id: int) -> Optional[sqlite3.Row]:
@@ -538,14 +641,18 @@ def track_user(user) -> None:
 # General Commands: /start, /help, /info
 # ==========================================
 
-def main_menu(user_id: Optional[int] = None):
-    rows = [
+def main_menu(user_id: Optional[int] = None, bot_username: Optional[str] = None):
+    rows = []
+    if bot_username:
+        rows.append([btn("➕ Add to Group", url=f"https://t.me/{bot_username}?startgroup=true")])
+
+    rows.extend([
         [btn(f"{e('otc')} My OTCs", "dash:groups", PRIMARY)],
         [btn(f"{e('settings')} OTC Settings", "dash:settings"),
          btn(f"{e('ai')} AI", "dash:ai", SUCCESS)],
         [btn(f"{e('help')} Help", "dash:help"),
          btn(f"{e('info')} Info", "dash:info")],
-    ]
+    ])
     if is_owner(user_id):
         rows.append([
             btn(f"{e('sponsor')} Sponsored", "dash:sponsored"),
@@ -561,70 +668,79 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     track_user(user)
 
-    if chat.type != ChatType.PRIVATE:
-        await register_group(chat)
-        await say(
-            update.effective_message,
-            context,
-            f"{e_html('success')} <b>OTC Registered:</b> <code>{esc(chat.title or 'OTC')}</code> is active.",
-        )
+    if chat.type in GROUP_TYPES:
+        await prompt_or_confirm_registration(chat, context)
         return
 
+    bot_username = context.bot.username or (await context.bot.get_me()).username
     text = (
         f"{e_html('tools')} <b>Welcome to OTC Utility Bot</b>\n\n"
         f"Manage your OTC groups effortlessly with scheduled pins, automatic member pinning, "
         f"AI activity summaries, and full group settings."
     )
-    text, markup = attach_sponsored_content(text, main_menu(user.id if user else None))
+    text, markup = attach_sponsored_content(text, main_menu(user.id if user else None, bot_username))
     await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    chat = update.effective_chat
     track_user(user)
+
+    bot_username = context.bot.username or (await context.bot.get_me()).username
+    add_url = f"https://t.me/{bot_username}?startgroup=true"
 
     lines = [
         f"{e_html('help')} <b>OTC Utility Bot — Command Guide</b>\n",
         f"<b>General:</b>",
-        f"• <code>/start</code> — Open the private dashboard",
-        f"• <code>/help</code> — Display this command reference",
-        f"• <code>/info</code> — View system stats and bot status\n",
+        f"• /start — Open the private dashboard",
+        f"• /help — Display this command reference",
+        f"• /info — View system stats and bot status\n",
         f"<b>OTC Management:</b>",
-        f"• <code>/register</code> — Register current OTC in dashboard\n",
+        f"• /register — Register group as an OTC\n",
         f"<b>Pin Management (Admins):</b>",
-        f"• <code>/pin</code> — Reply to pin indefinitely",
-        f"• <code>/pin 10m</code> — Reply to pin for duration (e.g. 30s, 10m, 2h, 1d)",
-        f"• <code>/unpin</code> — Reply to unpin message",
-        f"• <code>/cancelpin</code> — Cancel scheduled auto-unpin",
-        f"• <code>/pinlist</code> — View tracked pins\n",
+        f"• /pin — Reply to pin indefinitely",
+        f"• /pin 10m — Reply to pin for duration (e.g. 30s, 10m, 2h, 1d)",
+        f"• /unpin — Reply to unpin message",
+        f"• /cancelpin — Cancel scheduled auto-unpin",
+        f"• /pinlist — View tracked pins\n",
         f"<b>Automatic Pinning:</b>",
-        f"• <code>/apin</code> — Activate auto-pin mode for the next member message\n",
+        f"• /apin — Activate auto-pin mode for the next member message\n",
         f"<b>AI Insights:</b>",
-        f"• <code>/ai</code> — Run AI insights on recent OTC discussions\n",
+        f"• /ai — Run AI insights on recent OTC discussions\n",
         f"<b>Settings:</b>",
-        f"• <code>/settings</code> — Configure service message deletions, pin & AI features",
+        f"• /settings — Configure service message deletions, pin & AI features",
     ]
 
     if is_owner(user.id if user else None):
         lines.extend([
             f"\n<b>Owner Commands:</b>",
-            f"• <code>/prompt</code> — View/update AI system prompt",
-            f"• <code>/sponsored</code> — Manage system-wide sponsored text & button",
-            f"• <code>/bd</code> — Broadcast message to users or OTC groups",
-            f"• <code>/cancel</code> — Cancel active input operation",
+            f"• /prompt — View or update AI system prompt",
+            f"• /sponsored — Manage system-wide sponsored text & button",
+            f"• /bd — Broadcast message to users or OTC groups",
+            f"• /cancel — Cancel active input operation",
         ])
 
-    text, markup = attach_sponsored_content("\n".join(lines), dismiss_keyboard())
+    buttons = []
+    if chat and chat.type == ChatType.PRIVATE:
+        buttons.append([btn("➕ Add to Group", url=add_url)])
+    buttons.append([btn(f"{e('dismiss')} Dismiss", "dismiss", DANGER)])
+
+    text, markup = attach_sponsored_content("\n".join(lines), InlineKeyboardMarkup(buttons))
     await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
 
 
 async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    chat = update.effective_chat
     track_user(user)
 
     otc_count = q_one("SELECT COUNT(*) AS n FROM groups WHERE active=1")["n"]
     user_count = q_one("SELECT COUNT(*) AS n FROM users WHERE is_active=1")["n"]
     pin_count = q_one("SELECT COUNT(*) AS n FROM pins WHERE expires_at > ?", (time.time(),))["n"]
+
+    bot_username = context.bot.username or (await context.bot.get_me()).username
+    add_url = f"https://t.me/{bot_username}?startgroup=true"
 
     text = (
         f"{e_html('info')} <b>OTC Utility Bot Status</b>\n\n"
@@ -634,7 +750,13 @@ async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• {e_html('tools')} <b>Health Engine:</b> Port-Scan Safe ($PORT)\n"
         f"• {e_html('ai')} <b>AI Provider:</b> {GEMINI_MODEL if GEMINI_API_KEY else (OPENAI_MODEL if OPENAI_API_KEY else 'Disabled')}\n"
     )
-    text, markup = attach_sponsored_content(text, dismiss_keyboard())
+
+    buttons = []
+    if chat and chat.type == ChatType.PRIVATE:
+        buttons.append([btn("➕ Add to Group", url=add_url)])
+    buttons.append([btn(f"{e('dismiss')} Dismiss", "dismiss", DANGER)])
+
+    text, markup = attach_sponsored_content(text, InlineKeyboardMarkup(buttons))
     await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
 
 
@@ -662,7 +784,7 @@ async def cmd_pin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target = reply_target(message)
     if not target:
         await message.reply_text(
-            f"{e_html('warning')} Reply to the message you want to pin.\n<b>Usage:</b> <code>/pin 10m</code>",
+            f"{e_html('warning')} Reply to the message you want to pin.\n<b>Usage:</b> /pin 10m",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -715,7 +837,7 @@ async def cmd_unpin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     target = reply_target(message)
     if not target:
-        await message.reply_text(f"{e_html('warning')} Reply to the pinned message with <code>/unpin</code>.", parse_mode=ParseMode.HTML)
+        await message.reply_text(f"{e_html('warning')} Reply to the pinned message with /unpin.", parse_mode=ParseMode.HTML)
         return
     try:
         await context.bot.unpin_chat_message(message.chat_id, target.message_id)
@@ -735,7 +857,7 @@ async def cmd_cancelpin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     target = reply_target(message)
     if not target:
-        await message.reply_text(f"{e_html('warning')} Reply to the scheduled pin with <code>/cancelpin</code>.", parse_mode=ParseMode.HTML)
+        await message.reply_text(f"{e_html('warning')} Reply to the scheduled pin with /cancelpin.", parse_mode=ParseMode.HTML)
         return
 
     row = q_one(
@@ -806,14 +928,6 @@ async def pinlist_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await query.answer()
     await send_pinlist_page(chat_id, page, context, query=query)
-
-
-async def cmd_track(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if await require_group_admin(update, context):
-        await update.effective_message.reply_text(
-            f"{e_html('success')} This OTC is registered in the private dashboard.",
-            parse_mode=ParseMode.HTML,
-        )
 
 
 # ==========================================
@@ -892,14 +1006,12 @@ async def callback_apin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif action == "dur":
         duration = int(parts[4])
-        # Clean up setup and command messages
         await query.message.delete()
         try:
             await context.bot.delete_message(chat_id, cmd_msg_id)
         except TelegramError:
             pass
 
-        # Save pending auto-pin in SQLite
         execute(
             """INSERT INTO auto_pins(chat_id, admin_id, duration, status, created_at)
                VALUES(?, ?, ?, 'PENDING', ?)
@@ -942,6 +1054,11 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     track_user(user)
 
     if chat.type in GROUP_TYPES:
+        row = group_row(chat.id)
+        if not row:
+            await prompt_or_confirm_registration(chat, context)
+            return
+
         if not await is_group_admin(context.bot, chat.id, user.id):
             await update.effective_message.reply_text(f"{e_html('error')} Available to OTC admins only.", parse_mode=ParseMode.HTML)
             return
@@ -1036,9 +1153,13 @@ async def callback_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def render_group_picker_for_settings(message, context, user_id: int):
     groups = await eligible_groups(context.bot, user_id)
     if not groups:
+        bot_user = context.bot.username or (await context.bot.get_me()).username
+        add_url = f"https://t.me/{bot_user}?startgroup=true"
         await message.reply_text(
-            f"{e_html('warning')} <b>No OTCs found.</b>\nAdd me as admin to an OTC, then run <code>/register</code>.",
+            f"{e_html('warning')} <b>No registered OTCs found.</b>\n"
+            f"Add me to your group and run /register to register it.",
             parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[btn("➕ Add to Group", url=add_url)]]),
         )
         return
     rows = [[btn(f"{e('otc')} {g['title'][:40]}", f"st:cat:{g['chat_id']}:main", PRIMARY)] for g in groups]
@@ -1308,7 +1429,6 @@ async def execute_broadcast(bot, owner_id: int, target_type: str, from_chat_id: 
             except TelegramError:
                 pass
 
-        # Polite rate limit (~25 msgs/sec)
         await asyncio.sleep(0.04)
 
     finished_at = time.time()
@@ -1331,7 +1451,6 @@ async def execute_broadcast(bot, owner_id: int, target_type: str, from_chat_id: 
         f"• <b>Total Duration:</b> {human_time(duration)}"
     )
 
-    # Recipient breakdown
     recipients = q_all("SELECT * FROM broadcast_recipients WHERE broadcast_id=?", (broadcast_id,))
     if len(recipients) <= 20:
         lines = ["\n<b>Recipient Breakdown:</b>"]
@@ -1341,7 +1460,6 @@ async def execute_broadcast(bot, owner_id: int, target_type: str, from_chat_id: 
         report_text += "\n" + "\n".join(lines)
         await bot.send_message(owner_id, report_text, parse_mode=ParseMode.HTML)
     else:
-        # Generate downloadable detailed TXT report file
         buf = io.StringIO()
         buf.write("=====================================================\n")
         buf.write(f"OTC UTILITY BOT — BROADCAST REPORT #{broadcast_id}\n")
@@ -1432,13 +1550,9 @@ async def openai_generate(system: str, prompt: str) -> str:
 
 def sanitize_ai_output(raw: str) -> str:
     """Format AI output cleanly to Telegram HTML, eliminating Markdown artifacts."""
-    # Convert bold **text** to <b>text</b>
     t = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", raw)
-    # Convert headings ### or ## to bold
     t = re.sub(r"^#{1,6}\s*(.+)$", r"<b>\1</b>", t, flags=re.MULTILINE)
-    # Eliminate horizontal lines ---
     t = re.sub(r"^\s*[-*_]{3,}\s*$", "", t, flags=re.MULTILINE)
-    # Clean up excessive newlines
     t = re.sub(r"\n{3,}", "\n\n", t)
     return t.strip()
 
@@ -1454,7 +1568,6 @@ async def cmd_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await run_group_ai_core(message.chat_id, context, reply_to_msg=message)
     else:
-        # In private: select OTC
         await render_group_picker_for_ai(message, context, update.effective_user.id)
 
 
@@ -1486,7 +1599,6 @@ async def run_group_ai_core(chat_id: int, context: ContextTypes.DEFAULT_TYPE, qu
             await reply_to_msg.reply_text(msg, parse_mode=ParseMode.HTML)
         return
 
-    # Fetch latest eligible messages (chronological order)
     records = q_all(
         "SELECT user_id, username, created_at, body FROM group_messages WHERE chat_id=? ORDER BY created_at DESC, id DESC LIMIT ?",
         (chat_id, ANALYSIS_MESSAGE_LIMIT),
@@ -1510,7 +1622,6 @@ async def run_group_ai_core(chat_id: int, context: ContextTypes.DEFAULT_TYPE, qu
         status_msg = await reply_to_msg.reply_text(f"{e_html('ai')} Generating structured AI insights for this OTC…", parse_mode=ParseMode.HTML)
 
     try:
-        # Filter administrator messages if configured
         filtered_records = []
         for rec in reversed(records):
             if st["ai_exclude_admins"] and rec["user_id"]:
@@ -1572,9 +1683,13 @@ async def run_group_ai_core(chat_id: int, context: ContextTypes.DEFAULT_TYPE, qu
 async def render_group_picker_for_ai(message, context, user_id: int):
     groups = await eligible_groups(context.bot, user_id)
     if not groups:
+        bot_user = context.bot.username or (await context.bot.get_me()).username
+        add_url = f"https://t.me/{bot_user}?startgroup=true"
         await message.reply_text(
-            f"{e_html('warning')} <b>No OTCs found.</b>\nAdd me as admin to an OTC, then run <code>/register</code>.",
+            f"{e_html('warning')} <b>No registered OTCs found.</b>\n"
+            f"Add me to your group and run /register to register it.",
             parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[btn("➕ Add to Group", url=add_url)]]),
         )
         return
     rows = [[btn(f"{e('otc')} {g['title'][:40]}", f"grp:ai:{g['chat_id']}", PRIMARY)] for g in groups]
@@ -1657,10 +1772,16 @@ async def eligible_groups(bot, user_id: int):
 async def render_group_picker(query, context, action: str):
     groups = await eligible_groups(context.bot, query.from_user.id)
     if not groups:
+        bot_user = context.bot.username or (await context.bot.get_me()).username
+        add_url = f"https://t.me/{bot_user}?startgroup=true"
         await edit(
             query,
-            f"{e_html('warning')} <b>No OTCs found.</b>\nAdd me as admin to an OTC, then run <code>/register</code>.",
-            back_markup("dash:home"),
+            f"{e_html('warning')} <b>No registered OTCs found.</b>\n"
+            f"Add me to your group and run /register to register it.",
+            InlineKeyboardMarkup([
+                [btn("➕ Add to Group", url=add_url)],
+                [btn(f"{e('back')} Back", "dash:home")],
+            ]),
         )
         return
     rows = [[btn(f"{e('otc')} {g['title'][:40]}", f"grp:{action}:{g['chat_id']}", PRIMARY)] for g in groups]
@@ -1673,9 +1794,10 @@ async def dashboard_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.answer()
     data = query.data
     user_id = query.from_user.id
+    bot_username = context.bot.username or (await context.bot.get_me()).username
 
     if data == "dash:home":
-        text, markup = attach_sponsored_content(f"<b>{e_html('otc')} OTC Management</b>\nChoose an option:", main_menu(user_id))
+        text, markup = attach_sponsored_content(f"<b>{e_html('otc')} OTC Management</b>\nChoose an option:", main_menu(user_id, bot_username))
         await edit(query, text, markup)
     elif data == "dash:groups":
         await render_group_picker(query, context, "view")
@@ -1695,7 +1817,7 @@ async def dashboard_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await edit(
             query,
             f"<b>{e_html('help')} Dashboard Guide</b>\n\n"
-            f"• OTCs appear after the bot is added as administrator.\n"
+            f"• OTCs appear after the bot is added and registered via /register.\n"
             f"• Configure service message deletion and pin management via <b>OTC Settings</b>.\n"
             f"• Run AI activity summaries via <b>AI</b> button.",
             back_markup("dash:home"),
@@ -1744,7 +1866,7 @@ async def group_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==========================================
 
 async def on_service_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle service messages (join, leave, pinned, etc.) according to OTC settings."""
+    """Handle service messages according to OTC settings, and trigger registration when bot is added."""
     message = update.effective_message
     chat = update.effective_chat
     if not message or not chat or chat.type not in GROUP_TYPES:
@@ -1752,10 +1874,15 @@ async def on_service_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     st = get_otc_settings(chat.id)
 
-    # Member join
-    if message.new_chat_members and st["del_join"]:
-        await delete_message_safe(message)
-        return
+    # Bot added to group via service message
+    if message.new_chat_members:
+        bot_added = any(member.id == context.bot.id for member in message.new_chat_members)
+        if bot_added:
+            await prompt_or_confirm_registration(chat, context)
+            return
+        elif st["del_join"]:
+            await delete_message_safe(message)
+            return
 
     # Member leave
     if message.left_chat_member and st["del_leave"]:
@@ -1767,7 +1894,7 @@ async def on_service_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await delete_message_safe(message)
         return
 
-    # Other service messages (title changes, photos, migrations, video chats, etc.)
+    # Other service messages
     if st["del_service"]:
         if any((
             message.new_chat_title, message.new_chat_photo, message.delete_chat_photo,
@@ -1832,7 +1959,6 @@ async def track_group_activity(update: Update, context: ContextTypes.DEFAULT_TYP
 
         # Non-admin member message found
         if not is_admin and not is_cmd and not is_anon:
-            # Atomically claim pending pin
             execute("DELETE FROM auto_pins WHERE chat_id=?", (chat.id,))
             duration = pending_apin["duration"]
             expiry = time.time() + duration
@@ -1902,7 +2028,6 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
         setup["message_id"] = message.message_id
         setup["from_chat_id"] = message.chat_id
 
-        # Target count
         target_type = setup["target_type"]
         if target_type == "users":
             count = q_one("SELECT COUNT(*) AS n FROM users WHERE is_active=1")["n"]
@@ -1911,7 +2036,6 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
             count = q_one("SELECT COUNT(*) AS n FROM groups WHERE active=1")["n"]
             label = f"All Registered OTC Groups ({count})"
 
-        # Send preview
         await message.reply_text("<b>Broadcast Preview:</b>", parse_mode=ParseMode.HTML)
         await context.bot.copy_message(chat_id=message.chat_id, from_chat_id=message.chat_id, message_id=message.message_id)
 
@@ -1946,7 +2070,6 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
     # C. Sponsored Button Wizard
     if context.user_data.get("awaiting_sponsored_btn") and is_owner(user.id):
         content = (message.text or "").strip()
-        # Format: #style Button Text - https://t.me/example
         match = re.match(r"^(?:#(primary|success|danger|blue|green|red)\s+)?(.*?)\s*[-—]\s*(https?://\S+|t\.me/\S+)$", content, re.IGNORECASE)
         if not match:
             await message.reply_text(
@@ -2023,12 +2146,16 @@ async def receive_prompt_file(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def on_bot_membership(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     change = update.my_chat_member
-    if not chat or not change:
+    if not chat or not change or chat.type not in GROUP_TYPES:
         return
-    status = change.new_chat_member.status
-    if status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.MEMBER):
-        await register_group(chat)
-    elif status in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED):
+
+    old_status = change.old_chat_member.status
+    new_status = change.new_chat_member.status
+
+    if new_status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.MEMBER):
+        # Trigger interactive registration check whenever bot is added/promoted in group
+        await prompt_or_confirm_registration(chat, context)
+    elif new_status in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED):
         execute("UPDATE groups SET active=0 WHERE chat_id=?", (chat.id,))
         execute("DELETE FROM pins WHERE chat_id=?", (chat.id,))
         execute("DELETE FROM auto_pins WHERE chat_id=?", (chat.id,))
@@ -2249,7 +2376,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("cancelpin", cmd_cancelpin))
     app.add_handler(CommandHandler("pinlist", cmd_pinlist))
     app.add_handler(CommandHandler("apin", cmd_apin))
-    app.add_handler(CommandHandler("register", cmd_track))
+    app.add_handler(CommandHandler("register", cmd_register))
 
     # Settings & AI
     app.add_handler(CommandHandler("settings", cmd_settings))
@@ -2272,6 +2399,7 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(callback_sponsored, pattern=r"^sp:"))
     app.add_handler(CallbackQueryHandler(callback_broadcast, pattern=r"^bd:"))
     app.add_handler(CallbackQueryHandler(callback_cancel_prompt, pattern=r"^cancel_prompt$"))
+    app.add_handler(CallbackQueryHandler(callback_register, pattern=r"^reg:"))
 
     # Chat status, migration & membership
     app.add_handler(ChatMemberHandler(on_bot_membership, ChatMemberHandler.MY_CHAT_MEMBER))

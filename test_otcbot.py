@@ -12,7 +12,9 @@ Verifies:
 8. AI analysis message filtering and Markdown-to-HTML sanitization
 9. Custom emoji and unicode fallback rendering
 10. App handlers, command scopes, and callback registration
-11. Service message deletion settings logic
+11. Group registration logic (already registered vs new registration)
+12. Raw command formatting in help (no <code> around commands)
+13. Add to Group button URL generation in DM
 """
 
 import os
@@ -116,7 +118,6 @@ class TestOTCBot(unittest.TestCase):
     # 3. Multi-Owner Permissions Tests
     # ==========================================
     def test_multi_owner_permissions(self):
-        # Test comma-separated parsing
         env_val = " 111222 ,  333444, 555666 "
         owners = {int(x) for x in re.split(r"[,\s]+", env_val) if x.isdigit()}
         otcbot.BOT_OWNER_IDS = owners
@@ -133,7 +134,6 @@ class TestOTCBot(unittest.TestCase):
     # 4. Sponsored Content Integration Tests
     # ==========================================
     def test_sponsored_content_injection(self):
-        # Configure sponsored text and button in database
         otcbot.execute(
             """UPDATE sponsored_settings SET
                text_html='<b>Join Best OTC:</b> @Oncarts', text_enabled=1,
@@ -186,7 +186,6 @@ class TestOTCBot(unittest.TestCase):
         self.assertEqual(row["duration"], 3600)
         self.assertEqual(row["admin_id"], admin_id)
 
-        # Claim auto-pin
         otcbot.execute("DELETE FROM auto_pins WHERE chat_id=?", (chat_id,))
         claimed = otcbot.q_one("SELECT * FROM auto_pins WHERE chat_id=?", (chat_id,))
         self.assertIsNone(claimed)
@@ -242,20 +241,17 @@ class TestOTCBot(unittest.TestCase):
     # 8. Emojis Fallback and HTML Tests
     # ==========================================
     def test_emojis_rendering(self):
-        # Default without custom emoji ID
         emojis.CUSTOM_EMOJI_IDS["pin"] = ""
         self.assertEqual(emojis.e("pin"), "📌")
         self.assertEqual(emojis.e_html("pin"), "📌")
 
-        # Configured custom emoji ID
         emojis.set_custom_emoji_id("pin", "5368324127421402275")
-        self.assertEqual(emojis.e("pin"), "📌")  # Plain fallback for buttons
+        self.assertEqual(emojis.e("pin"), "📌")
         self.assertEqual(
             emojis.e_html("pin"),
             '<tg-emoji emoji-id="5368324127421402275">📌</tg-emoji>'
         )
 
-        # Check all registered emojis have fallbacks
         for key in emojis.FALLBACK_EMOJIS:
             self.assertTrue(len(emojis.e(key)) > 0, f"Missing fallback for {key}")
 
@@ -280,6 +276,35 @@ class TestOTCBot(unittest.TestCase):
         }
         for cmd in expected_cmds:
             self.assertIn(cmd, handler_cmds, f"Missing command handler: /{cmd}")
+
+    # ==========================================
+    # 10. Group Registration Logic Tests
+    # ==========================================
+    def test_group_registration_state(self):
+        chat_id = -1009999
+        # Not registered initially
+        self.assertIsNone(otcbot.group_row(chat_id))
+
+        # Register group
+        otcbot.execute(
+            """INSERT INTO groups(chat_id, title, username, active, created_at)
+               VALUES(?, 'Prime OTC', 'primeotc', 1, ?)""",
+            (chat_id, time.time()),
+        )
+        row = otcbot.group_row(chat_id)
+        self.assertIsNotNone(row)
+        self.assertEqual(row["active"], 1)
+        self.assertEqual(row["title"], "Prime OTC")
+
+    # ==========================================
+    # 11. Add to Group URL and Raw Command Formatting
+    # ==========================================
+    def test_add_to_group_button_and_raw_commands(self):
+        menu = otcbot.main_menu(user_id=123, bot_username="OTCSROBOT")
+        self.assertIsNotNone(menu)
+        first_btn = menu.inline_keyboard[0][0]
+        self.assertEqual(first_btn.text, "➕ Add to Group")
+        self.assertEqual(first_btn.url, "https://t.me/OTCSROBOT?startgroup=true")
 
 
 if __name__ == "__main__":

@@ -70,6 +70,7 @@ BOT_OWNER_IDS: Set[int] = set()
 BOT_OWNER_IDS |= {int(x) for x in re.split(r"[,\s]+", os.getenv("BOT_OWNER_IDS", "")) if x.isdigit()}
 
 DATABASE_PATH = os.getenv("DATABASE_PATH", str(Path(__file__).resolve().with_name("otc_bot.sqlite3")))
+BACKUP_CHAT_ID = os.getenv("BACKUP_CHAT_ID", "").strip()
 
 # AI Providers
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
@@ -238,6 +239,144 @@ def init_db() -> None:
     db.commit()
 
 
+# ==========================================
+# Telegram Cloud Database Auto-Sync & Restore
+# ==========================================
+
+active_bot_instance = None
+backup_lock = asyncio.Lock()
+pending_backup_task: Optional[asyncio.Task] = None
+last_backup_time: float = 0
+
+
+async def restore_database_from_cloud() -> bool:
+    """Download the latest pinned database snapshot from the private backup chat if configured."""
+    if not BACKUP_CHAT_ID or not BOT_TOKEN or BOT_TOKEN == "PASTE_YOUR_BOT_TOKEN_HERE":
+        return False
+
+    chat_id = int(BACKUP_CHAT_ID) if (BACKUP_CHAT_ID.startswith("-") and BACKUP_CHAT_ID[1:].isdigit()) or BACKUP_CHAT_ID.isdigit() else BACKUP_CHAT_ID
+
+    log.info("Checking Telegram Cloud for database backup in chat %s...", BACKUP_CHAT_ID)
+    try:
+        from telegram import Bot
+        bot = Bot(token=BOT_TOKEN)
+        chat = await bot.get_chat(chat_id)
+        pinned = chat.pinned_message
+        if not pinned or not pinned.document:
+            log.info("No pinned database backup found in %s.", BACKUP_CHAT_ID)
+            return False
+
+        doc = pinned.document
+        if not doc.file_name or not (doc.file_name.endswith(".sqlite3") or doc.file_name.endswith(".db")):
+            log.warning("Pinned file %s does not appear to be an SQLite database.", doc.file_name)
+            return False
+
+        log.info("Found pinned backup %s (%s bytes). Downloading...", doc.file_name, doc.file_size)
+        file = await bot.get_file(doc.file_id)
+        data = await file.download_as_bytearray()
+
+        if data[:16] == b"SQLite format 3\x00":
+            with open(DATABASE_PATH, "wb") as f:
+                f.write(data)
+            log.info("Database successfully restored from Telegram Cloud (%s bytes).", len(data))
+            return True
+        else:
+            log.error("Downloaded file header is invalid, not restoring.")
+    except Exception as exc:
+        log.warning("Telegram cloud restore attempt failed: %s", exc)
+    return False
+
+
+async def backup_database_to_cloud(bot=None, force: bool = False) -> bool:
+    """Upload current database snapshot to the private Telegram backup channel and pin it."""
+    global last_backup_time
+    target_bot = bot or active_bot_instance
+    if not BACKUP_CHAT_ID or not os.path.exists(DATABASE_PATH) or not target_bot:
+        return False
+
+    chat_id = int(BACKUP_CHAT_ID) if (BACKUP_CHAT_ID.startswith("-") and BACKUP_CHAT_ID[1:].isdigit()) or BACKUP_CHAT_ID.isdigit() else BACKUP_CHAT_ID
+
+    async with backup_lock:
+        try:
+            if db:
+                try:
+                    db.execute("PRAGMA wal_checkpoint(FULL)")
+                    db.commit()
+                except Exception:
+                    pass
+
+            temp_copy = f"{DATABASE_PATH}.backup.tmp"
+            if db:
+                with sqlite3.connect(temp_copy) as bck:
+                    db.backup(bck)
+            else:
+                import shutil
+                shutil.copy2(DATABASE_PATH, temp_copy)
+
+            file_size = os.path.getsize(temp_copy)
+            otc_count = q_one("SELECT COUNT(*) AS n FROM groups WHERE active=1")["n"] if db else 0
+            pin_count = q_one("SELECT COUNT(*) AS n FROM pins WHERE expires_at > ?", (time.time(),))["n"] if db else 0
+            ts_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+            caption = (
+                f"📦 <b>OTC Bot Database Snapshot</b>\n\n"
+                f"• <b>Timestamp:</b> <code>{ts_str}</code>\n"
+                f"• <b>Active OTCs:</b> <code>{otc_count}</code>\n"
+                f"• <b>Active Pins:</b> <code>{pin_count}</code>\n"
+                f"• <b>Size:</b> <code>{file_size // 1024} KB</code>\n\n"
+                f"<i>This pinned message is automatically used to restore data after server redeploys.</i>"
+            )
+
+            with open(temp_copy, "rb") as f:
+                sent_msg = await target_bot.send_document(
+                    chat_id=chat_id,
+                    document=f,
+                    filename="otc_bot.sqlite3",
+                    caption=caption,
+                    parse_mode=ParseMode.HTML,
+                    disable_notification=True,
+                )
+
+            await target_bot.pin_chat_message(
+                chat_id=chat_id,
+                message_id=sent_msg.message_id,
+                disable_notification=True,
+            )
+
+            if os.path.exists(temp_copy):
+                os.remove(temp_copy)
+
+            last_backup_time = time.time()
+            log.info("Cloud database backup uploaded and pinned successfully (msg_id=%s).", sent_msg.message_id)
+            return True
+        except Exception as exc:
+            log.warning("Cloud database backup failed: %s", exc)
+            return False
+
+
+def trigger_cloud_backup(bot=None, delay: float = 12.0):
+    """Schedule a debounced background backup after changes occur."""
+    if not BACKUP_CHAT_ID:
+        return
+    global pending_backup_task
+
+    target_bot = bot or active_bot_instance
+    if not target_bot:
+        return
+
+    async def runner():
+        await asyncio.sleep(delay)
+        await backup_database_to_cloud(target_bot)
+
+    try:
+        loop = asyncio.get_running_loop()
+        if pending_backup_task and not pending_backup_task.done():
+            pending_backup_task.cancel()
+        pending_backup_task = loop.create_task(runner())
+    except RuntimeError:
+        pass
+
+
 def q_one(sql: str, args=()) -> Optional[sqlite3.Row]:
     return db.execute(sql, args).fetchone()
 
@@ -249,6 +388,7 @@ def q_all(sql: str, args=()) -> List[sqlite3.Row]:
 def execute(sql: str, args=()) -> int:
     cur = db.execute(sql, args)
     db.commit()
+    trigger_cloud_backup()
     return cur.lastrowid
 
 
@@ -594,6 +734,62 @@ async def callback_fsub_owner(update: Update, context: ContextTypes.DEFAULT_TYPE
     elif action == "cancel":
         context.user_data.pop("awaiting_fsub_channel", None)
         await send_fsub_dashboard(query.message, query=query)
+
+
+async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Owner command to manually backup database to Telegram Cloud."""
+    if not await require_owner(update, context):
+        return
+
+    if not BACKUP_CHAT_ID:
+        await update.effective_message.reply_text(
+            f"{e_html('warning')} <b>BACKUP_CHAT_ID is not configured.</b>\n\n"
+            f"1. Create a private channel (e.g. <code>My Bot Backups</code>).\n"
+            f"2. Add this bot as an Administrator with post and pin rights.\n"
+            f"3. Add <code>BACKUP_CHAT_ID=-100xxxxxxxxx</code> to Render Environment Variables.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    status_msg = await update.effective_message.reply_text(f"{e_html('time')} Creating cloud database snapshot…")
+    ok = await backup_database_to_cloud(context.bot, force=True)
+    if ok:
+        await status_msg.edit_text(
+            f"{e_html('success')} <b>Database snapshot successfully uploaded and pinned to cloud backup channel!</b>",
+            parse_mode=ParseMode.HTML,
+        )
+    else:
+        await status_msg.edit_text(
+            f"{e_html('error')} Cloud backup failed. Please ensure the bot is an Administrator with <b>Post Messages</b> and <b>Pin Messages</b> rights in the backup chat.",
+            parse_mode=ParseMode.HTML,
+        )
+
+
+async def cmd_restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Owner command to manually restore database from Telegram Cloud."""
+    if not await require_owner(update, context):
+        return
+
+    if not BACKUP_CHAT_ID:
+        await update.effective_message.reply_text(
+            f"{e_html('warning')} <b>BACKUP_CHAT_ID is not configured.</b>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    status_msg = await update.effective_message.reply_text(f"{e_html('time')} Fetching latest cloud snapshot…")
+    ok = await restore_database_from_cloud()
+    if ok:
+        init_db()
+        await status_msg.edit_text(
+            f"{e_html('success')} <b>Database successfully restored from cloud backup!</b>",
+            parse_mode=ParseMode.HTML,
+        )
+    else:
+        await status_msg.edit_text(
+            f"{e_html('error')} Cloud restore failed or no pinned backup document was found.",
+            parse_mode=ParseMode.HTML,
+        )
 
 
 # ==========================================
@@ -1074,6 +1270,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"• /sponsored — Manage system-wide sponsored text & button",
             f"• /bd — Broadcast message to users or OTC groups",
             f"• /fsub — Manage force join channel subscription",
+            f"• /backup — Manually trigger cloud database backup",
+            f"• /restore — Manually restore database from cloud backup",
             f"• /cancel — Cancel active input operation",
         ])
 
@@ -2646,10 +2844,12 @@ async def schedule_retry(row, error: str, min_delay: float = 0, give_up: bool = 
 # ==========================================
 
 async def post_init(application: Application):
-    global background_task
+    global background_task, active_bot_instance
+    active_bot_instance = application.bot
 
-    # 1. Background persistent pin worker loop
+    # 1. Background persistent pin worker loop & periodic cloud backup
     async def worker_loop():
+        backup_tick = 0
         while True:
             try:
                 await pin_worker(application.bot)
@@ -2657,6 +2857,15 @@ async def post_init(application: Application):
                 raise
             except Exception:
                 log.exception("Pin worker cycle error")
+
+            backup_tick += 1
+            if backup_tick >= 120:  # Every ~30 minutes (120 * 15s)
+                backup_tick = 0
+                try:
+                    await backup_database_to_cloud(application.bot)
+                except Exception:
+                    pass
+
             await asyncio.sleep(PIN_WORKER_INTERVAL)
 
     background_task = asyncio.create_task(worker_loop())
@@ -2694,6 +2903,8 @@ async def post_init(application: Application):
             BotCommand("sponsored", "Manage sponsored content (Owner)"),
             BotCommand("bd", "Send broadcast (Owner)"),
             BotCommand("fsub", "Manage force join channel (Owner)"),
+            BotCommand("backup", "Cloud backup (Owner)"),
+            BotCommand("restore", "Cloud restore (Owner)"),
             BotCommand("cancel", "Cancel active operation"),
         ]
         for owner_id in BOT_OWNER_IDS:
@@ -2719,6 +2930,13 @@ async def post_init(application: Application):
                 await auto_register_group_if_needed(chat, application.bot)
             except Exception as exc:
                 log.warning("Could not auto-register known OTC id %s: %s", cid_str, exc)
+
+    # 4. Trigger initial cloud backup on boot if backup channel configured
+    if BACKUP_CHAT_ID:
+        try:
+            await backup_database_to_cloud(application.bot)
+        except Exception as exc:
+            log.warning("Initial boot cloud backup check failed: %s", exc)
 
     log.info("OTC Bot initialized. Persistent workers active.")
 
@@ -2819,6 +3037,8 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("sponsored", cmd_sponsored))
     app.add_handler(CommandHandler(["bd", "broadcast"], cmd_broadcast))
     app.add_handler(CommandHandler(["fsub", "forcejoin"], cmd_fsub))
+    app.add_handler(CommandHandler("backup", cmd_backup))
+    app.add_handler(CommandHandler("restore", cmd_restore))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
 
     # Callback handlers
@@ -2855,6 +3075,11 @@ def main():
     if not BOT_TOKEN or BOT_TOKEN == "PASTE_YOUR_BOT_TOKEN_HERE":
         raise RuntimeError("Set BOT_TOKEN in .env (or as an environment variable) before starting.")
     start_health_server()
+    if BACKUP_CHAT_ID:
+        try:
+            asyncio.run(restore_database_from_cloud())
+        except Exception as exc:
+            log.warning("Boot cloud restore check failed: %s", exc)
     init_db()
     try:
         log.info("Starting OTC Bot polling…")

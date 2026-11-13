@@ -317,6 +317,21 @@ class TestOTCBot(unittest.TestCase):
         self.assertEqual(first_btn.text, "➕ Add to Group")
         self.assertEqual(first_btn.url, "https://t.me/OTCSROBOT?startgroup=true")
 
+    # ==========================================
+    # 12. Telegram Cloud Auto-Backup Verification
+    # ==========================================
+    def test_cloud_backup_restore_guards(self):
+        otcbot.BACKUP_CHAT_ID = ""
+        # Should cleanly return False when BACKUP_CHAT_ID is unset
+        import asyncio
+        res = asyncio.run(otcbot.restore_database_from_cloud())
+        self.assertFalse(res)
+
+        # Database header magic check
+        with open(self.temp_db.name, "rb") as f:
+            header = f.read(16)
+        self.assertEqual(header, b"SQLite format 3\x00")
+
 
 if __name__ == "__main__":
     unittest.main()

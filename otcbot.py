@@ -2493,6 +2493,7 @@ async def post_init(application: Application):
             BotCommand("prompt", "Configure AI prompt (Owner)"),
             BotCommand("sponsored", "Manage sponsored content (Owner)"),
             BotCommand("bd", "Send broadcast (Owner)"),
+            BotCommand("fsub", "Manage force join channel (Owner)"),
             BotCommand("cancel", "Cancel active operation"),
         ]
         for owner_id in BOT_OWNER_IDS:
@@ -2641,7 +2642,12 @@ def main():
         raise RuntimeError("Set BOT_TOKEN in .env (or as an environment variable) before starting.")
     start_health_server()
     init_db()
-    build_app().run_polling(allowed_updates=Update.ALL_TYPES)
+    try:
+        log.info("Starting OTC Bot polling…")
+        build_app().run_polling(allowed_updates=Update.ALL_TYPES)
+    except Exception:
+        log.exception("FATAL: Bot polling crashed. Exiting.")
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

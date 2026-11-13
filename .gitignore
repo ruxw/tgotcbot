@@ -24,3 +24,8 @@ ENV/
 Thumbs.db
 .idea/
 .vscode/
+
+# Archives & Backups
+*.zip
+*.tar.gz
+*.rar

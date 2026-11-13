@@ -2,7 +2,7 @@
 emojis.py - Centralized emoji configuration for the Telegram OTC Bot.
 
 Provides clean, professional unicode fallback emojis along with support for
-Telegram custom emoji IDs (<tg-emoji emoji-id="...">fallback</tg-emoji>).
+Telegram custom premium emoji IDs (<tg-emoji emoji-id="...">fallback</tg-emoji>).
 
 Usage:
     from emojis import e, e_html
@@ -10,12 +10,12 @@ Usage:
     # In HTML messages:
     text = f"{e_html('pin')} Pinned message"
 
-    # In buttons, alerts, or plain text:
+    # In buttons, alerts, or plain text (no HTML tags in button text):
     button_text = f"{e('settings')} Settings"
 """
 
 import os
-from typing import Dict, Optional
+from typing import Dict
 
 # Custom Emoji IDs (supply Telegram custom emoji 64-bit integer IDs here or in .env).
 # If empty or not set, the fallback unicode emoji is used automatically.
@@ -26,6 +26,7 @@ CUSTOM_EMOJI_IDS: Dict[str, str] = {
     "settings": os.getenv("EMOJI_SETTINGS_ID", ""),
     "ai": os.getenv("EMOJI_AI_ID", ""),
     "help": os.getenv("EMOJI_HELP_ID", ""),
+    "info": os.getenv("EMOJI_INFO_ID", ""),
     "success": os.getenv("EMOJI_SUCCESS_ID", ""),
     "warning": os.getenv("EMOJI_WARNING_ID", ""),
     "error": os.getenv("EMOJI_ERROR_ID", ""),
@@ -33,7 +34,16 @@ CUSTOM_EMOJI_IDS: Dict[str, str] = {
     "admin": os.getenv("EMOJI_ADMIN_ID", ""),
     "tools": os.getenv("EMOJI_TOOLS_ID", ""),
     "dismiss": os.getenv("EMOJI_DISMISS_ID", ""),
-    "info": os.getenv("EMOJI_INFO_ID", ""),
+    "broadcast": os.getenv("EMOJI_BROADCAST_ID", ""),
+    "sponsor": os.getenv("EMOJI_SPONSOR_ID", ""),
+    "toggle_on": os.getenv("EMOJI_TOGGLE_ON_ID", ""),
+    "toggle_off": os.getenv("EMOJI_TOGGLE_OFF_ID", ""),
+    "user": os.getenv("EMOJI_USER_ID", ""),
+    "stats": os.getenv("EMOJI_STATS_ID", ""),
+    "link": os.getenv("EMOJI_LINK_ID", ""),
+    "clock": os.getenv("EMOJI_CLOCK_ID", ""),
+    "delete": os.getenv("EMOJI_DELETE_ID", ""),
+    "proceed": os.getenv("EMOJI_PROCEED_ID", ""),
 }
 
 # Clean, professional unicode fallback emojis
@@ -44,7 +54,7 @@ FALLBACK_EMOJIS: Dict[str, str] = {
     "settings": "⚙️",
     "ai": "🤖",
     "help": "ℹ️",
-    "info": "ℹ️",
+    "info": "📋",
     "success": "✅",
     "warning": "⚠️",
     "error": "❌",
@@ -54,6 +64,16 @@ FALLBACK_EMOJIS: Dict[str, str] = {
     "dismiss": "✕",
     "back": "‹",
     "forward": "›",
+    "broadcast": "📢",
+    "sponsor": "⭐",
+    "toggle_on": "🟢",
+    "toggle_off": "🔴",
+    "user": "👤",
+    "stats": "📊",
+    "link": "🔗",
+    "clock": "⏳",
+    "delete": "🗑️",
+    "proceed": "▶️",
 }
 
 
@@ -70,6 +90,7 @@ def e_html(name: str) -> str:
     Return an emoji suitable for Telegram HTML-formatted messages.
     If a valid numeric custom emoji ID is configured, wraps with <tg-emoji>.
     Otherwise returns the clean unicode fallback emoji.
+    Never duplicates emojis.
     """
     fallback = FALLBACK_EMOJIS.get(name, "")
     custom_id = str(CUSTOM_EMOJI_IDS.get(name, "")).strip()

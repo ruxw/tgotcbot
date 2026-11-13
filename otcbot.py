@@ -334,6 +334,31 @@ async def bot_can_pin(bot, chat_id: int) -> bool:
         return False
 
 
+async def auto_register_group_if_needed(chat, bot) -> bool:
+    """Ensure an active group is recorded in the database whenever any activity is observed."""
+    if not chat or chat.type not in GROUP_TYPES:
+        return False
+    row = group_row(chat.id)
+    if row:
+        return True
+    try:
+        me = await bot.get_chat_member(chat.id, bot.id)
+        if me.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.MEMBER):
+            execute(
+                """INSERT INTO groups(chat_id, title, username, active, created_at)
+                   VALUES(?, ?, ?, 1, ?)
+                   ON CONFLICT(chat_id) DO UPDATE SET
+                   title=excluded.title, username=excluded.username, active=1""",
+                (chat.id, chat.title or "OTC", chat.username, time.time()),
+            )
+            get_otc_settings(chat.id)
+            log.info("Auto-registered active OTC: %s (id=%s)", chat.title, chat.id)
+            return True
+    except TelegramError:
+        pass
+    return False
+
+
 async def require_group_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """Verify that update occurred in an OTC group and sender is an authorized administrator."""
     message = update.effective_message
@@ -353,20 +378,23 @@ async def require_group_admin(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return False
 
-    # Check if group is registered as an OTC
+    # Check if group is registered as an OTC; auto-register if bot is present as admin/member
     row = group_row(chat.id)
     if not row:
-        text = (
-            f"<b>{e_html('warning')} This group is not registered as an OTC yet.</b>\n\n"
-            f"Do you want to register this group as an OTC?\n"
-            f"<i>Only group administrators can complete this registration.</i>"
-        )
-        markup = InlineKeyboardMarkup([
-            [btn(f"{e('otc')} Register as OTC", f"reg:confirm:{chat.id}", SUCCESS)],
-            [btn(f"{e('dismiss')} Dismiss", "dismiss", DANGER)],
-        ])
-        await message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
-        return False
+        if await auto_register_group_if_needed(chat, context.bot):
+            row = group_row(chat.id)
+        else:
+            text = (
+                f"<b>{e_html('warning')} This group is not registered as an OTC yet.</b>\n\n"
+                f"Do you want to register this group as an OTC?\n"
+                f"<i>Only group administrators can complete this registration.</i>"
+            )
+            markup = InlineKeyboardMarkup([
+                [btn(f"{e('otc')} Register as OTC", f"reg:confirm:{chat.id}", SUCCESS)],
+                [btn(f"{e('dismiss')} Dismiss", "dismiss", DANGER)],
+            ])
+            await message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+            return False
 
     # Check OTC general active setting
     st = get_otc_settings(chat.id)
@@ -815,22 +843,120 @@ async def callback_register(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await edit(query, text, markup)
 
 
+async def handle_dm_connect_group(message, context, user, raw_target: str) -> bool:
+    """Validate and register a group directly from DM via username, link, or ID."""
+    clean_target = raw_target.strip()
+    if clean_target.startswith("https://t.me/"):
+        clean_target = clean_target.replace("https://t.me/", "")
+    if clean_target.startswith("http://t.me/"):
+        clean_target = clean_target.replace("http://t.me/", "")
+    if clean_target.startswith("t.me/"):
+        clean_target = clean_target.replace("t.me/", "")
+
+    if not clean_target.startswith("@") and not (clean_target.startswith("-") and clean_target[1:].isdigit()) and not clean_target.isdigit():
+        clean_target = f"@{clean_target}"
+
+    target_id_or_user = int(clean_target) if (clean_target.startswith("-") and clean_target[1:].isdigit()) else clean_target
+
+    try:
+        target_chat = await context.bot.get_chat(target_id_or_user)
+    except TelegramError as exc:
+        await message.reply_text(
+            f"{e_html('error')} <b>Could not find group:</b> {esc(str(exc))}\n\n"
+            f"Make sure the bot has been added to the group first.",
+            parse_mode=ParseMode.HTML,
+        )
+        return False
+
+    if target_chat.type not in GROUP_TYPES:
+        await message.reply_text(f"{e_html('warning')} That chat is not a group or supergroup.", parse_mode=ParseMode.HTML)
+        return False
+
+    try:
+        me = await context.bot.get_chat_member(target_chat.id, context.bot.id)
+        if me.status != ChatMemberStatus.ADMINISTRATOR:
+            await message.reply_text(
+                f"{e_html('warning')} I am in <b>{esc(target_chat.title)}</b>, but I must be promoted to <b>Administrator</b> with Pin permissions to manage it.",
+                parse_mode=ParseMode.HTML,
+            )
+            return False
+    except TelegramError:
+        await message.reply_text(
+            f"{e_html('error')} I am not a member of <b>{esc(target_chat.title)}</b>. Please add me first.",
+            parse_mode=ParseMode.HTML,
+        )
+        return False
+
+    if not is_owner(user.id):
+        try:
+            member = await context.bot.get_chat_member(target_chat.id, user.id)
+            if member.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
+                await message.reply_text(
+                    f"{e_html('error')} You are not an administrator of <b>{esc(target_chat.title)}</b>.",
+                    parse_mode=ParseMode.HTML,
+                )
+                return False
+        except TelegramError:
+            await message.reply_text(
+                f"{e_html('error')} Could not verify your admin status in <b>{esc(target_chat.title)}</b>.",
+                parse_mode=ParseMode.HTML,
+            )
+            return False
+
+    execute(
+        """INSERT INTO groups(chat_id, title, username, active, created_at)
+           VALUES(?, ?, ?, 1, ?)
+           ON CONFLICT(chat_id) DO UPDATE SET
+           title=excluded.title, username=excluded.username, active=1""",
+        (target_chat.id, target_chat.title or "OTC", target_chat.username, time.time()),
+    )
+    get_otc_settings(target_chat.id)
+
+    await message.reply_text(
+        f"{e_html('success')} <b>Successfully connected OTC:</b> <b>{esc(target_chat.title)}</b>!\n\n"
+        f"You can now configure settings, pin management, and AI discussions directly from your dashboard.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [btn(f"{e('otc')} View My OTCs", "dash:groups", PRIMARY)],
+            [btn(f"{e('settings')} OTC Settings", f"st:cat:{target_chat.id}:main")],
+        ]),
+    )
+    return True
+
+
 async def cmd_register(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Manual /register command inside a group or DM."""
     message = update.effective_message
     chat = update.effective_chat
     user = update.effective_user
-    if not message or not chat:
+    if not message or not chat or not user:
         return
 
-    if chat.type not in GROUP_TYPES:
+    track_user(user)
+
+    if chat.type == ChatType.PRIVATE:
+        if not await enforce_force_sub(update, context):
+            return
+
+        if context.args:
+            raw_target = context.args[0].strip()
+            await handle_dm_connect_group(message, context, user, raw_target)
+            return
+
         bot_user = context.bot.username or (await context.bot.get_me()).username
         add_url = f"https://t.me/{bot_user}?startgroup=true"
         await message.reply_text(
-            f"{e_html('warning')} The /register command works in OTC groups only.\n"
-            f"Add me to your group with the button below:",
+            f"<b>{e_html('otc')} Connect an OTC Group</b>\n\n"
+            f"If I am already in your group as an Administrator:\n"
+            f"• Send: <code>/register @GroupUsername</code>\n"
+            f"• Or send: <code>/register -100xxxxxxxx</code> (Chat ID)\n"
+            f"• Or simply <b>forward any message</b> from that group to this chat!\n\n"
+            f"If I am not in your group yet, tap <b>'Add to Group'</b> below:",
             parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[btn("➕ Add to Group", url=add_url)]]),
+            reply_markup=InlineKeyboardMarkup([
+                [btn("➕ Add to Group", url=add_url)],
+                [btn(f"{e('dismiss')} Dismiss", "dismiss", DANGER)],
+            ]),
         )
         return
 
@@ -1390,8 +1516,11 @@ async def render_group_picker_for_settings(message, context, user_id: int):
         bot_user = context.bot.username or (await context.bot.get_me()).username
         add_url = f"https://t.me/{bot_user}?startgroup=true"
         await message.reply_text(
-            f"{e_html('warning')} <b>No registered OTCs found.</b>\n"
-            f"Add me to your group and run /register to register it.",
+            f"{e_html('warning')} <b>No registered OTCs found.</b>\n\n"
+            f"If I am already in your group as an Administrator, connect it instantly:\n"
+            f"• Send <code>/register @GroupUsername</code> in this chat\n"
+            f"• Or simply <b>forward any message</b> from that group to this chat!\n\n"
+            f"To add me to a new group, tap <b>Add to Group</b> below:",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([[btn("➕ Add to Group", url=add_url)]]),
         )
@@ -1920,8 +2049,11 @@ async def render_group_picker_for_ai(message, context, user_id: int):
         bot_user = context.bot.username or (await context.bot.get_me()).username
         add_url = f"https://t.me/{bot_user}?startgroup=true"
         await message.reply_text(
-            f"{e_html('warning')} <b>No registered OTCs found.</b>\n"
-            f"Add me to your group and run /register to register it.",
+            f"{e_html('warning')} <b>No registered OTCs found.</b>\n\n"
+            f"If I am already in your group as an Administrator, connect it instantly:\n"
+            f"• Send <code>/register @GroupUsername</code> in this chat\n"
+            f"• Or simply <b>forward any message</b> from that group to this chat!\n\n"
+            f"To add me to a new group, tap <b>Add to Group</b> below:",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([[btn("➕ Add to Group", url=add_url)]]),
         )
@@ -2010,8 +2142,11 @@ async def render_group_picker(query, context, action: str):
         add_url = f"https://t.me/{bot_user}?startgroup=true"
         await edit(
             query,
-            f"{e_html('warning')} <b>No registered OTCs found.</b>\n"
-            f"Add me to your group and run /register to register it.",
+            f"{e_html('warning')} <b>No registered OTCs found.</b>\n\n"
+            f"If I am already in your group as an Administrator, connect it instantly:\n"
+            f"• Send <code>/register @GroupUsername</code> in this chat\n"
+            f"• Or simply <b>forward any message</b> from that group to this chat!\n\n"
+            f"To add me to a new group, tap <b>Add to Group</b> below.",
             InlineKeyboardMarkup([
                 [btn("➕ Add to Group", url=add_url)],
                 [btn(f"{e('back')} Back", "dash:home")],
@@ -2110,6 +2245,7 @@ async def on_service_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not message or not chat or chat.type not in GROUP_TYPES:
         return
 
+    await auto_register_group_if_needed(chat, context.bot)
     st = get_otc_settings(chat.id)
 
     # Bot added to group via service message
@@ -2155,6 +2291,7 @@ async def track_group_activity(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     track_user(user)
+    await auto_register_group_if_needed(chat, context.bot)
 
     # 1. Custom duration input for /apin
     if "awaiting_apin_custom" in context.chat_data and user:
@@ -2370,6 +2507,27 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
         await send_fsub_dashboard(message)
         return
 
+    # F. Check if message is a forwarded message from an OTC group to connect it
+    fwd_chat = getattr(message, "forward_from_chat", None)
+    if not fwd_chat and getattr(message, "forward_origin", None):
+        orig = message.forward_origin
+        if getattr(orig, "chat", None):
+            fwd_chat = orig.chat
+
+    if fwd_chat and fwd_chat.type in GROUP_TYPES:
+        await handle_dm_connect_group(message, context, user, str(fwd_chat.id))
+        return
+
+    # G. Check if user typed a group username, link, or ID directly in DM to connect it
+    raw_text = (message.text or "").strip()
+    if raw_text.startswith("@") or raw_text.startswith("https://t.me/") or raw_text.startswith("t.me/") or (raw_text.startswith("-100") and raw_text[1:].isdigit()):
+        if await handle_dm_connect_group(message, context, user, raw_text):
+            return
+
+    # Enforce force subscription for normal private chat messages
+    if not await enforce_force_sub(update, context):
+        return
+
 
 async def receive_prompt_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
@@ -2547,6 +2705,20 @@ async def post_init(application: Application):
         log.info("Telegram native bot command scopes configured successfully.")
     except Exception as exc:
         log.warning("Could not set bot commands: %s", exc)
+
+    # 3. Auto-recover known OTC groups configured in environment (survives ephemeral cloud redeploys)
+    known_otc_env = os.getenv("KNOWN_OTC_IDS", "")
+    if known_otc_env:
+        for cid_str in re.split(r"[,\s]+", known_otc_env):
+            cid_str = cid_str.strip()
+            if not cid_str:
+                continue
+            try:
+                cid = int(cid_str)
+                chat = await application.bot.get_chat(cid)
+                await auto_register_group_if_needed(chat, application.bot)
+            except Exception as exc:
+                log.warning("Could not auto-register known OTC id %s: %s", cid_str, exc)
 
     log.info("OTC Bot initialized. Persistent workers active.")
 

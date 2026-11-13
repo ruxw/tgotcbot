@@ -389,6 +389,186 @@ async def require_group_admin(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 # ==========================================
+# Force Joining (Mandatory Channel Subscription)
+# ==========================================
+
+def get_force_sub_info() -> Tuple[bool, str, str]:
+    """Returns (enabled: bool, channel_identifier: str, channel_url: str)."""
+    row_ch = q_one("SELECT value FROM settings WHERE key='force_sub_channel'")
+    row_en = q_one("SELECT value FROM settings WHERE key='force_sub_enabled'")
+
+    channel = row_ch["value"].strip() if (row_ch and row_ch["value"]) else os.getenv("FORCE_SUB_CHANNEL", "").strip()
+    if not channel:
+        return False, "", ""
+
+    if row_en:
+        enabled = bool(int(row_en["value"]))
+    else:
+        enabled = True
+
+    # Build clean link
+    if channel.startswith("http://") or channel.startswith("https://"):
+        url = channel
+    elif channel.startswith("@"):
+        url = f"https://t.me/{channel[1:]}"
+    else:
+        url = f"https://t.me/{channel}"
+
+    return enabled, channel, url
+
+
+async def user_is_subscribed(bot, user_id: int) -> bool:
+    """Check if user has joined the required channel. Returns True if exempt, joined, or disabled."""
+    if is_owner(user_id):
+        return True
+
+    enabled, channel, _ = get_force_sub_info()
+    if not enabled or not channel:
+        return True
+
+    chat_id_or_user = int(channel) if (channel.startswith("-") and channel[1:].isdigit()) else channel
+
+    try:
+        member = await bot.get_chat_member(chat_id_or_user, user_id)
+        return member.status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
+    except TelegramError as exc:
+        log.warning("Force sub verification check for channel %s failed: %s", channel, exc)
+        # Fail open if bot is not admin in channel or channel is misconfigured to avoid trapping users
+        return True
+
+
+async def enforce_force_sub(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Enforces channel membership in private chat. Returns True if allowed, False if blocked."""
+    chat = update.effective_chat
+    user = update.effective_user
+    if not chat or chat.type != ChatType.PRIVATE or not user:
+        return True
+
+    if is_owner(user.id):
+        return True
+
+    subscribed = await user_is_subscribed(context.bot, user.id)
+    if subscribed:
+        return True
+
+    enabled, channel, url = get_force_sub_info()
+    text = (
+        f"<b>{e_html('warning')} Mandatory Channel Subscription Required</b>\n\n"
+        f"To use this bot, you must first join our official updates channel: <b>{esc(channel)}</b>.\n\n"
+        f"1. Tap <b>'Join Channel'</b> below.\n"
+        f"2. Return here and tap <b>'Joined / Verify'</b> to unlock all features."
+    )
+    markup = InlineKeyboardMarkup([
+        [btn(f"{e('broadcast')} Join Channel", url=url)],
+        [btn(f"{e('success')} Joined / Verify", "fsub:check", SUCCESS)],
+    ])
+
+    if update.callback_query:
+        await edit(update.callback_query, text, markup)
+    elif update.effective_message:
+        await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+    return False
+
+
+async def callback_force_sub(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Callback triggered when user taps 'Joined / Verify'."""
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+
+    subscribed = await user_is_subscribed(context.bot, user_id)
+    if subscribed:
+        await query.answer("Verification successful! Welcome.", show_alert=False)
+        bot_username = context.bot.username or (await context.bot.get_me()).username
+        text = (
+            f"{e_html('success')} <b>Membership Verified!</b>\n\n"
+            f"Welcome to OTC Utility Bot. Choose an option below:"
+        )
+        text, markup = attach_sponsored_content(text, main_menu(user_id, bot_username))
+        await edit(query, text, markup)
+    else:
+        await query.answer("You have not joined the channel yet! Please join first, then tap Verify.", show_alert=True)
+
+
+async def cmd_fsub(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Owner command to view or configure force joining (/fsub)."""
+    if not await require_owner(update, context):
+        return
+
+    # Check if channel argument supplied directly: /fsub @mychannel
+    if context.args:
+        new_ch = context.args[0].strip()
+        execute("INSERT INTO settings(key,value) VALUES('force_sub_channel',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (new_ch,))
+        execute("INSERT INTO settings(key,value) VALUES('force_sub_enabled','1') ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+        await update.effective_message.reply_text(
+            f"{e_html('success')} <b>Force Join Channel set and enabled:</b> <code>{esc(new_ch)}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    await send_fsub_dashboard(update.effective_message)
+
+
+async def send_fsub_dashboard(message, query=None):
+    enabled, channel, url = get_force_sub_info()
+    st_text = f"{e('toggle_on')} ON" if enabled else f"{e('toggle_off')} OFF"
+    ch_text = f"<b>{esc(channel)}</b> ({url})" if channel else "<i>None configured</i>"
+
+    text = (
+        f"<b>{e_html('broadcast')} Force Joining (FSub) Management</b>\n\n"
+        f"• <b>Status:</b> {st_text}\n"
+        f"• <b>Target Channel:</b> {ch_text}\n\n"
+        f"When enabled, users must join this channel before interacting with the bot in DM."
+    )
+    markup = InlineKeyboardMarkup([
+        [
+            btn(f"{e('toggle_on' if enabled else 'toggle_off')} Toggle ON/OFF", "fsub:toggle"),
+            btn("📢 Set Channel", "fsub:set_ch", PRIMARY),
+        ],
+        [
+            btn("🗑️ Remove Channel", "fsub:remove", DANGER),
+            btn(f"{e('dismiss')} Close", "dismiss", DANGER),
+        ],
+    ])
+    if query:
+        await edit(query, text, markup)
+    else:
+        await message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+
+async def callback_fsub_owner(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle owner callbacks for /fsub dashboard."""
+    query = update.callback_query
+    await query.answer()
+    if not is_owner(query.from_user.id):
+        await query.answer(f"{e('error')} Owner only.", show_alert=True)
+        return
+
+    action = query.data.split(":")[1]
+    enabled, channel, _ = get_force_sub_info()
+
+    if action == "toggle":
+        new_val = "0" if enabled else "1"
+        execute("INSERT INTO settings(key,value) VALUES('force_sub_enabled',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (new_val,))
+        await send_fsub_dashboard(query.message, query=query)
+    elif action == "remove":
+        execute("DELETE FROM settings WHERE key IN ('force_sub_channel', 'force_sub_enabled')")
+        await send_fsub_dashboard(query.message, query=query)
+    elif action == "set_ch":
+        context.user_data["awaiting_fsub_channel"] = True
+        await edit(
+            query,
+            f"<b>{e_html('broadcast')} Set Force Join Channel:</b>\n\n"
+            f"Send the channel username (e.g. <code>@MyChannel</code>) or invite link in the next message.\n\n"
+            f"<i>Make sure to add the bot as an administrator in the channel so it can verify member subscriptions.</i>",
+            InlineKeyboardMarkup([[btn(f"{e('dismiss')} Cancel", "fsub:cancel", DANGER)]]),
+        )
+    elif action == "cancel":
+        context.user_data.pop("awaiting_fsub_channel", None)
+        await send_fsub_dashboard(query.message, query=query)
+
+
+# ==========================================
 # Sponsored Content System
 # ==========================================
 
@@ -672,6 +852,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await prompt_or_confirm_registration(chat, context)
         return
 
+    if not await enforce_force_sub(update, context):
+        return
+
     bot_username = context.bot.username or (await context.bot.get_me()).username
     text = (
         f"{e_html('tools')} <b>Welcome to OTC Utility Bot</b>\n\n"
@@ -686,6 +869,10 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat = update.effective_chat
     track_user(user)
+
+    if chat and chat.type == ChatType.PRIVATE:
+        if not await enforce_force_sub(update, context):
+            return
 
     bot_username = context.bot.username or (await context.bot.get_me()).username
     add_url = f"https://t.me/{bot_username}?startgroup=true"
@@ -718,6 +905,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"• /prompt — View or update AI system prompt",
             f"• /sponsored — Manage system-wide sponsored text & button",
             f"• /bd — Broadcast message to users or OTC groups",
+            f"• /fsub — Manage force join channel subscription",
             f"• /cancel — Cancel active input operation",
         ])
 
@@ -734,6 +922,10 @@ async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat = update.effective_chat
     track_user(user)
+
+    if chat and chat.type == ChatType.PRIVATE:
+        if not await enforce_force_sub(update, context):
+            return
 
     otc_count = q_one("SELECT COUNT(*) AS n FROM groups WHERE active=1")["n"]
     user_count = q_one("SELECT COUNT(*) AS n FROM users WHERE is_active=1")["n"]
@@ -1796,6 +1988,10 @@ async def dashboard_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user_id = query.from_user.id
     bot_username = context.bot.username or (await context.bot.get_me()).username
 
+    # Enforce force subscription for all dashboard interactions
+    if not await enforce_force_sub(update, context):
+        return
+
     if data == "dash:home":
         text, markup = attach_sponsored_content(f"<b>{e_html('otc')} OTC Management</b>\nChoose an option:", main_menu(user_id, bot_username))
         await edit(query, text, markup)
@@ -2111,6 +2307,27 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
         await message.reply_text(f"{e_html('success')} <b>AI Prompt saved successfully!</b>", parse_mode=ParseMode.HTML)
         return
 
+    # E. Force Sub Channel Wizard
+    if context.user_data.get("awaiting_fsub_channel") and is_owner(user.id):
+        new_ch = (message.text or "").strip()
+        if not new_ch:
+            await message.reply_text(f"{e_html('warning')} Channel cannot be empty. Send a username like @MyChannel or a URL.")
+            return
+        execute(
+            "INSERT INTO settings(key,value) VALUES('force_sub_channel',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (new_ch,),
+        )
+        execute(
+            "INSERT INTO settings(key,value) VALUES('force_sub_enabled','1') ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+        )
+        context.user_data.pop("awaiting_fsub_channel", None)
+        await message.reply_text(
+            f"{e_html('success')} <b>Force Join Channel set and enabled:</b> <code>{esc(new_ch)}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        await send_fsub_dashboard(message)
+        return
+
 
 async def receive_prompt_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
@@ -2386,6 +2603,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("prompt", cmd_prompt))
     app.add_handler(CommandHandler("sponsored", cmd_sponsored))
     app.add_handler(CommandHandler(["bd", "broadcast"], cmd_broadcast))
+    app.add_handler(CommandHandler(["fsub", "forcejoin"], cmd_fsub))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
 
     # Callback handlers
@@ -2400,6 +2618,8 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(callback_broadcast, pattern=r"^bd:"))
     app.add_handler(CallbackQueryHandler(callback_cancel_prompt, pattern=r"^cancel_prompt$"))
     app.add_handler(CallbackQueryHandler(callback_register, pattern=r"^reg:"))
+    app.add_handler(CallbackQueryHandler(callback_force_sub, pattern=r"^fsub:check$"))
+    app.add_handler(CallbackQueryHandler(callback_fsub_owner, pattern=r"^fsub:(?!check).*$"))
 
     # Chat status, migration & membership
     app.add_handler(ChatMemberHandler(on_bot_membership, ChatMemberHandler.MY_CHAT_MEMBER))

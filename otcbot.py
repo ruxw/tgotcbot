@@ -57,7 +57,7 @@ from telegram.ext import (
     CommandHandler, ContextTypes, MessageHandler, filters,
 )
 
-from emojis import e, e_html
+from emojis import FALLBACK_EMOJIS, e, e_html, get_emoji_id
 
 # ==========================================
 # Configuration
@@ -610,13 +610,21 @@ def attach_sponsored_content(text: str, reply_markup=None) -> Tuple[str, Optiona
 esc = html.escape
 
 
-def btn(text: str, data: Optional[str] = None, style: Optional[str] = None, *, url: Optional[str] = None) -> InlineKeyboardButton:
-    """Inline button supporting text, callback_data, URLs, and Bot API 9.4+ styles.
-    Usage:
-        btn("Text", "callback_data")            – plain callback button
-        btn("Text", "callback_data", PRIMARY)   – styled callback button
-        btn("Text", url="https://...")          – URL button
-        btn("Text", url="https://...", style=SUCCESS)  – styled URL button
+def btn(
+    text: str,
+    data: Optional[str] = None,
+    style: Optional[str] = None,
+    *,
+    url: Optional[str] = None,
+    emoji: Optional[str] = None,
+    icon_custom_emoji_id: Optional[str] = None,
+) -> InlineKeyboardButton:
+    """Inline button supporting text, callback_data, URLs, Bot API styles,
+    and Telegram custom premium emoji icons (icon_custom_emoji_id).
+
+    If an emoji key or leading fallback emoji is matched and a custom emoji ID
+    is configured in .env, icon_custom_emoji_id is attached and the fallback
+    emoji is automatically stripped from the text to prevent duplicates.
     """
     kwargs = {}
     if url:
@@ -624,12 +632,40 @@ def btn(text: str, data: Optional[str] = None, style: Optional[str] = None, *, u
     elif data is not None:
         kwargs["callback_data"] = data
 
+    target_emoji_id = icon_custom_emoji_id
+    if not target_emoji_id:
+        if emoji and get_emoji_id(emoji):
+            target_emoji_id = get_emoji_id(emoji)
+        else:
+            for key, fb in FALLBACK_EMOJIS.items():
+                if fb and text.startswith(fb):
+                    custom_id = get_emoji_id(key)
+                    if custom_id:
+                        target_emoji_id = custom_id
+                        text = text[len(fb):].lstrip()
+                    break
+
+    if target_emoji_id:
+        kwargs["icon_custom_emoji_id"] = str(target_emoji_id)
+
     if style:
         try:
             return InlineKeyboardButton(text, style=style, **kwargs)
         except TypeError:
-            return InlineKeyboardButton(text, api_kwargs={"style": style}, **kwargs)
-    return InlineKeyboardButton(text, **kwargs)
+            api_kw = {"style": style}
+            if target_emoji_id:
+                api_kw["icon_custom_emoji_id"] = str(target_emoji_id)
+                kwargs.pop("icon_custom_emoji_id", None)
+            return InlineKeyboardButton(text, api_kwargs=api_kw, **kwargs)
+
+    try:
+        return InlineKeyboardButton(text, **kwargs)
+    except TypeError:
+        api_kw = {}
+        if target_emoji_id:
+            api_kw["icon_custom_emoji_id"] = str(target_emoji_id)
+            kwargs.pop("icon_custom_emoji_id", None)
+        return InlineKeyboardButton(text, api_kwargs=api_kw, **kwargs)
 
 
 def human_time(seconds: float) -> str:

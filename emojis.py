@@ -15,7 +15,7 @@ Usage:
 """
 
 import os
-from typing import Dict
+from typing import Dict, Optional
 
 # Custom Emoji IDs (supply Telegram custom emoji 64-bit integer IDs here or in .env).
 # If empty or not set, the fallback unicode emoji is used automatically.
@@ -100,6 +100,12 @@ def e_html(name: str) -> str:
     if custom_id and custom_id.isdigit():
         return f'<tg-emoji emoji-id="{custom_id}">{fallback}</tg-emoji>'
     return fallback
+
+
+def get_emoji_id(name: str) -> Optional[str]:
+    """Return numeric custom emoji ID if set and valid, else None."""
+    val = str(CUSTOM_EMOJI_IDS.get(name, "")).strip()
+    return val if (val and val.isdigit()) else None
 
 
 def set_custom_emoji_id(name: str, emoji_id: str) -> None:

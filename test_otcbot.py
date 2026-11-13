@@ -255,6 +255,17 @@ class TestOTCBot(unittest.TestCase):
         for key in emojis.FALLBACK_EMOJIS:
             self.assertTrue(len(emojis.e(key)) > 0, f"Missing fallback for {key}")
 
+        # Test icon_custom_emoji_id on inline buttons
+        emojis.set_custom_emoji_id("settings", "")
+        b_no_custom = otcbot.btn(f"{emojis.e('settings')} Settings", "dash:settings")
+        self.assertEqual(b_no_custom.text, "⚙️ Settings")
+        self.assertIsNone(getattr(b_no_custom, "icon_custom_emoji_id", None))
+
+        emojis.set_custom_emoji_id("settings", "5432198765432109834")
+        b_with_custom = otcbot.btn(f"{emojis.e('settings')} Settings", "dash:settings")
+        self.assertEqual(b_with_custom.text, "Settings")
+        self.assertEqual(getattr(b_with_custom, "icon_custom_emoji_id", None), "5432198765432109834")
+
     # ==========================================
     # 9. App Handlers & Callback Registration
     # ==========================================

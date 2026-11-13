@@ -44,6 +44,8 @@ CUSTOM_EMOJI_IDS: Dict[str, str] = {
     "clock": os.getenv("EMOJI_CLOCK_ID", ""),
     "delete": os.getenv("EMOJI_DELETE_ID", ""),
     "proceed": os.getenv("EMOJI_PROCEED_ID", ""),
+    "back": os.getenv("EMOJI_BACK_ID", ""),
+    "forward": os.getenv("EMOJI_FORWARD_ID", ""),
 }
 
 # Clean, professional unicode fallback emojis

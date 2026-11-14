@@ -144,7 +144,8 @@ class TestOTCBot(unittest.TestCase):
         original_text = "<b>Notification:</b> Message pinned."
         wrapped_text, markup = otcbot.attach_sponsored_content(original_text)
 
-        self.assertIn("—", wrapped_text)
+        self.assertIn("<blockquote>", wrapped_text)
+        self.assertIn("</blockquote>", wrapped_text)
         self.assertIn("<b>Join Best OTC:</b> @Oncarts", wrapped_text)
         self.assertIsNotNone(markup)
         self.assertEqual(len(markup.inline_keyboard), 1)

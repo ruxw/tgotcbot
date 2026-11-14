@@ -810,9 +810,11 @@ def attach_sponsored_content(text: str, reply_markup=None) -> Tuple[str, Optiona
     if not sp:
         return text, reply_markup
 
-    # Append sponsored text if enabled
+    # Append sponsored text if enabled (formatted as a Telegram quotation/blockquote)
     if sp["text_enabled"] and sp["text_html"]:
-        text = f"{text}\n\n—\n{sp['text_html']}"
+        content = sp["text_html"].strip()
+        sp_block = content if (content.startswith("<blockquote>") and content.endswith("</blockquote>")) else f"<blockquote>{content}</blockquote>"
+        text = f"{text}\n\n{sp_block}"
 
     # Append sponsored button if enabled
     if sp["button_enabled"] and sp["button_url"] and sp["button_text"]:
